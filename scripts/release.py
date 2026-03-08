@@ -70,6 +70,40 @@ def _get_manufacturer(cfg: dict) -> Optional[str]:
 
 _BOARDS_DIR = Path("main/boards")
 
+
+def _validate_manufacturer(board: str, cfg_path: Path, manufacturer: Optional[str]) -> Optional[str]:
+    """Validate manufacturer against the board directory layout."""
+    if "/" in board:
+        expected_manufacturer = board.split("/")[0]
+        if not manufacturer:
+            return (
+                f"{cfg_path}: Board is in '{expected_manufacturer}/' subdirectory, "
+                f"but config.json is missing \"manufacturer\": \"{expected_manufacturer}\""
+            )
+        if manufacturer != expected_manufacturer:
+            return (
+                f"{cfg_path}: manufacturer mismatch, "
+                f"directory is '{expected_manufacturer}/' but config.json has \"{manufacturer}\""
+            )
+    elif manufacturer:
+        return (
+            f"{cfg_path}: Board is not in a manufacturer subdirectory, "
+            f"but config.json defines manufacturer \"{manufacturer}\", "
+            f"please move board to main/boards/{manufacturer}/{board}/"
+        )
+    return None
+
+
+def _report_manufacturer_errors(errors: list[str]) -> None:
+    """Print manufacturer validation errors and exit."""
+    if not errors:
+        return
+    print("\n[ERROR] Found manufacturer configuration issues:", file=sys.stderr)
+    for err in errors:
+        print(f"  - {err}", file=sys.stderr)
+    print(file=sys.stderr)
+    sys.exit(1)
+
 def _collect_variants(config_filename: str = "config.json") -> list[dict[str, str]]:
     """Traverse all boards under main/boards, collect variant information.
 
@@ -91,29 +125,9 @@ def _collect_variants(config_filename: str = "config.json") -> list[dict[str, st
                 cfg = json.load(f)
 
             manufacturer = _get_manufacturer(cfg)
-
-            # Check manufacturer consistency with directory structure
-            if "/" in board:
-                # Board is in a subdirectory (e.g., waveshare/esp32-p4-nano)
-                expected_manufacturer = board.split("/")[0]
-                if not manufacturer:
-                    errors.append(
-                        f"{cfg_path}: Board is in '{expected_manufacturer}/' subdirectory, "
-                        f"but config.json is missing \"manufacturer\": \"{expected_manufacturer}\""
-                    )
-                elif manufacturer != expected_manufacturer:
-                    errors.append(
-                        f"{cfg_path}: manufacturer mismatch, "
-                        f"directory is '{expected_manufacturer}/' but config.json has \"{manufacturer}\""
-                    )
-            else:
-                # Board is directly under boards/ directory
-                if manufacturer:
-                    errors.append(
-                        f"{cfg_path}: Board is not in a manufacturer subdirectory, "
-                        f"but config.json defines manufacturer \"{manufacturer}\", "
-                        f"please move board to main/boards/{manufacturer}/{board}/"
-                    )
+            validation_error = _validate_manufacturer(board, cfg_path, manufacturer)
+            if validation_error:
+                errors.append(validation_error)
 
             for build in cfg.get("builds", []):
                 name = build["name"]
@@ -127,14 +141,7 @@ def _collect_variants(config_filename: str = "config.json") -> list[dict[str, st
         except Exception as e:
             print(f"[ERROR] Failed to parse {cfg_path}: {e}", file=sys.stderr)
 
-    # Report all errors at once
-    if errors:
-        print("\n[ERROR] Found manufacturer configuration issues:", file=sys.stderr)
-        for err in errors:
-            print(f"  - {err}", file=sys.stderr)
-        print(file=sys.stderr)
-        sys.exit(1)
-
+    _report_manufacturer_errors(errors)
     return variants
 
 
@@ -236,6 +243,9 @@ def release(board_type: str, config_filename: str = "config.json", *, filter_nam
         cfg = json.load(f)
     target = cfg["target"]
     manufacturer = _get_manufacturer(cfg)
+    validation_error = _validate_manufacturer(board_type, cfg_path, manufacturer)
+    if validation_error:
+        _report_manufacturer_errors([validation_error])
 
     builds = cfg.get("builds", [])
     if filter_name:
@@ -339,11 +349,11 @@ if __name__ == "__main__":
         print(f"[ERROR] board_type {board_type_input} not found in main/CMakeLists.txt", file=sys.stderr)
         sys.exit(1)
 
-    variants_all = _collect_variants(config_filename=args.config)
-
-    # Filter board_type list
+    # Filter board_type list. Only "all" needs to scan and validate the entire
+    # boards tree; building one board should not be blocked by unrelated boards.
     target_board_types: set[str]
     if board_type_input == "all":
+        variants_all = _collect_variants(config_filename=args.config)
         target_board_types = {v["board"] for v in variants_all}
     else:
         target_board_types = {board_type_input}
