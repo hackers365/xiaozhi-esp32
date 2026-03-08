@@ -61,6 +61,7 @@ void esp_blufi_btc_deinit(void);
 #include "esp_mac.h"
 #include "mbedtls/md5.h"
 #include "ssid_manager.h"
+#include "provision_report.h"
 
 static const char* BLUFI_TAG = "BLUFI_CLASS";
 
@@ -808,11 +809,14 @@ void Blufi::_handle_event(esp_blufi_cb_event_t event, esp_blufi_cb_param_t* para
                         self->m_provisioned = true;
 
                         auto current_ssid = wifi.GetSsid();
+                        auto current_ip = wifi.GetIpAddress();
                         if (!current_ssid.empty()) {
                             self->m_sta_ssid_len = static_cast<int>(
                                 std::min(current_ssid.size(), sizeof(self->m_sta_ssid)));
                             memcpy(self->m_sta_ssid, current_ssid.c_str(), self->m_sta_ssid_len);
                         }
+
+                        ProvisionReport::ReportWifiProvisionedAsync(current_ssid, current_ip);
 
                         wifi_ap_record_t ap_info{};
                         if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
