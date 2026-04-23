@@ -126,11 +126,11 @@ def _collect_variants(config_filename: str = "config.json") -> list[dict[str, st
                 })
 
         except Exception as e:
-            print(f"[ERROR] Failed to parse {cfg_path}: {e}", file=sys.stderr)
+            errors.append(f"{cfg_path}: failed to parse config.json: {e}")
 
     # Report all errors at once
     if errors:
-        print("\n[ERROR] Found manufacturer configuration issues:", file=sys.stderr)
+        print("\n[ERROR] Found board configuration issues:", file=sys.stderr)
         for err in errors:
             print(f"  - {err}", file=sys.stderr)
         print(file=sys.stderr)

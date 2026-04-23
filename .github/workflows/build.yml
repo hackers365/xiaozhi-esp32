@@ -6,6 +6,8 @@ on:
     branches:
       - main
       - ci/* # for ci test
+    tags:
+      - '**'
   pull_request:
     branches:
       - main
@@ -37,10 +39,11 @@ jobs:
         name: Select variants based on changes
         env:
           ALL_VARIANTS: ${{ steps.list.outputs.all_variants }}
+        shell: bash
         run: |
           EVENT_NAME="${{ github.event_name }}"
 
-          # push / workflow_dispatch 场景（分支或手动触发）编译全部变体
+          # push / workflow_dispatch 场景（分支、tag 或手动触发）编译全部变体
           if [[ "$EVENT_NAME" == "push" || "$EVENT_NAME" == "workflow_dispatch" ]]; then
             echo "variants=$ALL_VARIANTS" >> $GITHUB_OUTPUT
             exit 0
@@ -56,7 +59,11 @@ jobs:
 
           NEED_ALL=0
           declare -A AFFECTED
+          mapfile -t KNOWN_BOARDS < <(echo "$ALL_VARIANTS" | jq -r '.[].board' | sort -u)
+
           while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+
             if [[ "$file" == main/* && "$file" != main/boards/* ]]; then
               NEED_ALL=1
             fi
@@ -66,8 +73,12 @@ jobs:
             fi
 
             if [[ "$file" == main/boards/* ]]; then
-              board=$(echo "$file" | cut -d '/' -f3)
-              AFFECTED[$board]=1
+              for board in "${KNOWN_BOARDS[@]}"; do
+                if [[ "$file" == "main/boards/$board" || "$file" == "main/boards/$board/"* ]]; then
+                  AFFECTED[$board]=1
+                  break
+                fi
+              done
             fi
           done <<< "$CHANGED"
 
@@ -104,9 +115,47 @@ jobs:
           source $IDF_PATH/export.sh
           python scripts/release.py ${{ matrix.board }} --name ${{ matrix.name }}
 
-      - name: Upload artifacts
+      - name: Upload packaged firmware
         uses: actions/upload-artifact@v4
         with:
           name: xiaozhi_${{ matrix.full_name }}_${{ github.sha }}
-          path: build/merged-binary.bin
+          path: releases/*.zip
           if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    needs:
+      - prepare
+      - build
+    if: ${{ startsWith(github.ref, 'refs/tags/') && needs.prepare.outputs.variants != '[]' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged firmware
+        uses: actions/download-artifact@v4
+        with:
+          pattern: xiaozhi_*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create or update release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(release-assets/*.zip)
+
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "No release assets found"
+            exit 1
+          fi
+
+          if ! gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release create "$TAG_NAME" --title "$TAG_NAME" --generate-notes
+          fi
+
+          gh release upload "$TAG_NAME" "${files[@]}" --clobber
