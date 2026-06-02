@@ -115,8 +115,8 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
         } else if (strcmp(type->valuestring, "goodbye") == 0) {
             auto session_id = cJSON_GetObjectItem(root, "session_id");
             ESP_LOGI(TAG, "Received goodbye message, session_id: %s",
-                     session_id ? session_id->valuestring : "null");
-            if (session_id == nullptr || session_id_ == session_id->valuestring) {
+                     cJSON_IsString(session_id) ? session_id->valuestring : "null");
+            if (session_id == nullptr || (cJSON_IsString(session_id) && session_id_ == session_id->valuestring)) {
                 auto alive = alive_;  // Capture alive flag
                 Application::GetInstance().Schedule([this, alive]() {
                     if (*alive) {
