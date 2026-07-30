@@ -2,15 +2,12 @@ name: Build Boards
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-      - ci/* # for ci test
-    tags:
-      - '**'
-  pull_request:
-    branches:
-      - main
+    inputs:
+      board:
+        description: '指定编译的板子/变体名称 (例如: taiji-pi-s3，或填 all 编译全部)'
+        required: false
+        default: 'all'
+        type: string
 
 permissions:
   contents: read
@@ -19,6 +16,8 @@ jobs:
   prepare:
     name: Determine variants to build
     runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.0.1
     outputs:
       variants: ${{ steps.select.outputs.variants }}
     steps:
@@ -27,72 +26,55 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Test build tooling
+        run: python -m unittest discover -s scripts/tests -v
 
       - id: list
         name: Get all variant list
         run: |
-          echo "all_variants=$(python scripts/release.py --list-boards --json)" >> $GITHUB_OUTPUT
+          echo "all_variants=$(python scripts/build.py --list-boards --json)" >> $GITHUB_OUTPUT
 
       - id: select
         name: Select variants based on changes
+        shell: bash
         env:
           ALL_VARIANTS: ${{ steps.list.outputs.all_variants }}
-        shell: bash
         run: |
           EVENT_NAME="${{ github.event_name }}"
+          BOARD_INPUT="${{ inputs.board }}"
 
-          # push / workflow_dispatch 场景（分支、tag 或手动触发）编译全部变体
-          if [[ "$EVENT_NAME" == "push" || "$EVENT_NAME" == "workflow_dispatch" ]]; then
+          # 手动触发且指定了具体的板卡名称
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && -n "$BOARD_INPUT" && "$BOARD_INPUT" != "all" ]]; then
+            FILTERED=$(echo "$ALL_VARIANTS" | jq -c --arg target "$BOARD_INPUT" 'map(select(.name == $target or .board == $target or .reported_type == $target))')
+            if [[ "$FILTERED" == "[]" ]]; then
+              echo "Error: No matching board variant found for input '$BOARD_INPUT'"
+              exit 1
+            fi
+            echo "variants=$FILTERED" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # 手动触发默认编译全部变体
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             echo "variants=$ALL_VARIANTS" >> $GITHUB_OUTPUT
             exit 0
           fi
 
           # pull_request 场景
-          BASE_SHA="${{ github.event.pull_request.base.sha }}"
-          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-          echo "Base: $BASE_SHA, Head: $HEAD_SHA"
+          # actions/checkout checks out GitHub's synthetic PR merge commit. Its
+          # first and second parents are the exact base and head commits used
+          # for this run, even when the event SHAs are not exposed as refs in
+          # the job container.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          BASE_SHA="HEAD^1"
+          HEAD_SHA="HEAD^2"
+          echo "Base: $(git rev-parse "$BASE_SHA"), Head: $(git rev-parse "$HEAD_SHA")"
 
-          CHANGED=$(git diff --name-only $BASE_SHA $HEAD_SHA || true)
+          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
           echo -e "Changed files:\n$CHANGED"
 
-          NEED_ALL=0
-          declare -A AFFECTED
-          mapfile -t KNOWN_BOARDS < <(echo "$ALL_VARIANTS" | jq -r '.[].board' | sort -u)
-
-          while IFS= read -r file; do
-            [[ -z "$file" ]] && continue
-
-            if [[ "$file" == main/* && "$file" != main/boards/* ]]; then
-              NEED_ALL=1
-            fi
-
-            if [[ "$file" == main/boards/common/* ]]; then
-              NEED_ALL=1
-            fi
-
-            if [[ "$file" == main/boards/* ]]; then
-              for board in "${KNOWN_BOARDS[@]}"; do
-                if [[ "$file" == "main/boards/$board" || "$file" == "main/boards/$board/"* ]]; then
-                  AFFECTED[$board]=1
-                  break
-                fi
-              done
-            fi
-          done <<< "$CHANGED"
-
-          if [[ "$NEED_ALL" -eq 1 ]]; then
-            echo "variants=$ALL_VARIANTS" >> $GITHUB_OUTPUT
-          else
-            if [[ ${#AFFECTED[@]} -eq 0 ]]; then
-              echo "variants=[]" >> $GITHUB_OUTPUT
-            else
-              BOARDS_JSON=$(printf '%s\n' "${!AFFECTED[@]}" | sort -u | jq -R -s -c 'split("\n")[:-1]')
-              FILTERED=$(echo "$ALL_VARIANTS" | jq -c --argjson boards "$BOARDS_JSON" 'map(select(.board as $b | $boards | index($b)))')
-              echo "variants=$FILTERED" >> $GITHUB_OUTPUT
-            fi
-          fi
+          SELECTED=$(printf '%s\n' "$CHANGED" | python scripts/build.py --select-changed)
+          echo "variants=$SELECTED" >> $GITHUB_OUTPUT
 
   build:
     name: Build ${{ matrix.full_name }}
@@ -104,7 +86,7 @@ jobs:
         include: ${{ fromJson(needs.prepare.outputs.variants) }}
     runs-on: ubuntu-latest
     container:
-      image: espressif/idf:v5.5.2
+      image: espressif/idf:v6.0.1
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -113,7 +95,7 @@ jobs:
         shell: bash
         run: |
           source $IDF_PATH/export.sh
-          python scripts/release.py ${{ matrix.board }} --name ${{ matrix.name }}
+          python scripts/build.py ${{ matrix.board }} --name ${{ matrix.name }}
 
       - name: Upload packaged firmware
         uses: actions/upload-artifact@v4
@@ -159,3 +141,48 @@ jobs:
           fi
 
           gh release upload "$TAG_NAME" "${files[@]}" --clobber
+
+  esp32s31-idf61:
+    name: Build ESP32-S31 with IDF 6.1
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:release-v6.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build ESP32-S31 preview variant
+        shell: bash
+        run: |
+          source $IDF_PATH/export.sh
+          python scripts/build.py espressif/esp32-s31-function-coreboard-1 \
+            --name esp32-s31-function-coreboard-1
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xiaozhi_espressif-esp32-s31-function-coreboard-1_${{ github.sha }}
+          path: build/merged-binary.bin
+          if-no-files-found: error
+
+  blufi-idf6:
+    name: IDF 6 BluFi option
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.0.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build BluFi-enabled firmware
+        shell: bash
+        run: |
+          source $IDF_PATH/export.sh
+          idf.py -B build-blufi \
+            -DSDKCONFIG=build-blufi/sdkconfig \
+            -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;scripts/ci/blufi.sdkconfig.defaults" \
+            -DIDF_TARGET=esp32s3 \
+            -DBOARD_NAME=bread-compact-wifi \
+            -DBOARD_TYPE=bread-compact-wifi \
+            build
+>>>>>>> dd99da00dc4c89ed4ab07fcec038c03f13f4de50

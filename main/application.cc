@@ -8,13 +8,13 @@
 #include "mqtt_protocol.h"
 #include "settings.h"
 #include "system_info.h"
+#include "text_glyph_payload.h"
 #include "websocket_protocol.h"
 
 #include <driver/gpio.h>
 #include <esp_log.h>
 #include <arpa/inet.h>
 #include <cJSON.h>
-#include <font_awesome.h>
 #include <cstring>
 
 #define TAG "Application"
@@ -79,6 +79,9 @@ void Application::Initialize() {
     };
     callbacks.on_vad_change = [this](bool speaking) {
         xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
+    };
+    callbacks.on_playback_drained = [this]() {
+        xEventGroupSetBits(event_group_, MAIN_EVENT_PLAYBACK_DRAINED);
     };
     audio_service_.SetCallbacks(callbacks);
 
@@ -171,7 +174,7 @@ void Application::Run() {
         MAIN_EVENT_VAD_CHANGE | MAIN_EVENT_CLOCK_TICK | MAIN_EVENT_ERROR |
         MAIN_EVENT_NETWORK_CONNECTED | MAIN_EVENT_NETWORK_DISCONNECTED | MAIN_EVENT_TOGGLE_CHAT |
         MAIN_EVENT_START_LISTENING | MAIN_EVENT_STOP_LISTENING | MAIN_EVENT_ACTIVATION_DONE |
-        MAIN_EVENT_STATE_CHANGED;
+        MAIN_EVENT_STATE_CHANGED | MAIN_EVENT_PLAYBACK_DRAINED;
 
     while (true) {
         auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE, portMAX_DELAY);
@@ -198,6 +201,16 @@ void Application::Run() {
             HandleStateChangedEvent();
         }
 
+        if (bits & MAIN_EVENT_PLAYBACK_DRAINED) {
+            // Deferred listening start (auto mode): the playback queue has
+            // drained, so it is now safe to enable voice processing.
+            if (pending_listening_start_ && GetDeviceState() == kDeviceStateListening &&
+                audio_service_.IsPlaybackIdle()) {
+                pending_listening_start_ = false;
+                StartListeningAudio();
+            }
+        }
+
         if (bits & MAIN_EVENT_TOGGLE_CHAT) {
             HandleToggleChatEvent();
         }
@@ -213,6 +226,12 @@ void Application::Run() {
         if (bits & MAIN_EVENT_SEND_AUDIO) {
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
                 if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
+                    // Drop the remaining packets. Leaving them in the queue would
+                    // stall the Opus codec task (it waits for queue space), which in
+                    // turn deadlocks the whole audio input pipeline, as no new
+                    // MAIN_EVENT_SEND_AUDIO event would ever be triggered again.
+                    while (audio_service_.PopPacketFromSendQueue())
+                        ;
                     break;
                 }
             }
@@ -246,6 +265,8 @@ void Application::Run() {
             // Print debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
                 SystemInfo::PrintHeapStats();
+                // SystemInfo::PrintTaskList();
+                // SystemInfo::PrintTaskCpuUsage(pdMS_TO_TICKS(1000));
             }
         }
     }
@@ -391,7 +412,7 @@ void Application::CheckAssetsVersion() {
     // Apply assets
     assets.Apply();
     display->SetChatMessage("system", "");
-    display->SetEmotion("microchip_ai");
+    display->SetEmotion("robot_2");
 }
 
 void Application::CheckNewVersion() {
@@ -523,8 +544,15 @@ void Application::InitializeProtocol() {
     protocol_->OnIncomingJson([this, display](const cJSON* root) {
         // Parse JSON data
         auto type = cJSON_GetObjectItem(root, "type");
+        if (!cJSON_IsString(type)) {
+            ESP_LOGW(TAG, "Incoming JSON message has no type");
+            return;
+        }
         if (strcmp(type->valuestring, "tts") == 0) {
             auto state = cJSON_GetObjectItem(root, "state");
+            if (!cJSON_IsString(state)) {
+                return;
+            }
             if (strcmp(state->valuestring, "start") == 0) {
                 Schedule([this]() {
                     aborted_ = false;
@@ -543,8 +571,15 @@ void Application::InitializeProtocol() {
             } else if (strcmp(state->valuestring, "sentence_start") == 0) {
                 auto text = cJSON_GetObjectItem(root, "text");
                 if (cJSON_IsString(text)) {
+                    std::vector<TextGlyph> glyphs;
+                    uint8_t bpp = 0;
+                    if (!TextGlyphPayload::Parse(root, glyphs, bpp)) {
+                        glyphs.clear();
+                    }
                     ESP_LOGI(TAG, "<< %s", text->valuestring);
-                    Schedule([display, message = std::string(text->valuestring)]() {
+                    Schedule([display, message = std::string(text->valuestring),
+                              glyphs = std::move(glyphs), bpp]() {
+                        display->AddTextGlyphs(glyphs, bpp);
                         display->SetChatMessage("assistant", message.c_str());
                     });
                 }
@@ -552,8 +587,15 @@ void Application::InitializeProtocol() {
         } else if (strcmp(type->valuestring, "stt") == 0) {
             auto text = cJSON_GetObjectItem(root, "text");
             if (cJSON_IsString(text)) {
+                std::vector<TextGlyph> glyphs;
+                uint8_t bpp = 0;
+                if (!TextGlyphPayload::Parse(root, glyphs, bpp)) {
+                    glyphs.clear();
+                }
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
-                Schedule([display, message = std::string(text->valuestring)]() {
+                Schedule([display, message = std::string(text->valuestring),
+                          glyphs = std::move(glyphs), bpp]() {
+                    display->AddTextGlyphs(glyphs, bpp);
                     display->SetChatMessage("user", message.c_str());
                 });
             }
@@ -730,6 +772,9 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
 
     if (!protocol_->IsAudioChannelOpened()) {
         if (!protocol_->OpenAudioChannel()) {
+            // Return to idle so the device is not stuck in the connecting
+            // state (not every failure path reports a network error)
+            SetDeviceState(kDeviceStateIdle);
             return;
         }
     }
@@ -793,18 +838,7 @@ void Application::HandleWakeWordDetectedEvent() {
     ESP_LOGI(TAG, "Wake word detected: %s (state: %d)", wake_word.c_str(), (int)state);
 
     if (state == kDeviceStateIdle) {
-        audio_service_.EncodeWakeWord();
-        auto wake_word = audio_service_.GetLastWakeWord();
-
-        if (!protocol_->IsAudioChannelOpened()) {
-            SetDeviceState(kDeviceStateConnecting);
-            // Schedule to let the state change be processed first (UI update),
-            // then continue with OpenAudioChannel which may block for ~1 second
-            Schedule([this, wake_word]() { ContinueWakeWordInvoke(wake_word); });
-            return;
-        }
-        // Channel already opened, continue directly
-        ContinueWakeWordInvoke(wake_word);
+        BeginWakeWordInvoke(wake_word);
     } else if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
         AbortSpeaking(kAbortReasonWakeWordDetected);
         // Clear send queue to avoid sending residues to server
@@ -828,6 +862,30 @@ void Application::HandleWakeWordDetectedEvent() {
     }
 }
 
+void Application::BeginWakeWordInvoke(const std::string& wake_word) {
+    // Must run in the main task with the device in idle state
+    audio_service_.EncodeWakeWord();
+
+    // Always pass through the connecting state, even if the audio channel is
+    // already opened. ContinueWakeWordInvoke() rejects any other state, so
+    // skipping this transition would silently drop the wake word invocation.
+    if (!SetDeviceState(kDeviceStateConnecting)) {
+        // Wake word detection was stopped by the detection itself; restore it
+        // so the device does not become unresponsive to wake words.
+        audio_service_.EnableWakeWordDetection(true);
+        return;
+    }
+
+    if (!protocol_->IsAudioChannelOpened()) {
+        // Schedule to let the state change be processed first (UI update),
+        // then continue with OpenAudioChannel which may block for ~1 second
+        Schedule([this, wake_word]() { ContinueWakeWordInvoke(wake_word); });
+        return;
+    }
+    // Channel already opened, continue directly
+    ContinueWakeWordInvoke(wake_word);
+}
+
 void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
     // Check state again in case it was changed during scheduling
     if (GetDeviceState() != kDeviceStateConnecting) {
@@ -840,7 +898,10 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
 
     if (!protocol_->IsAudioChannelOpened()) {
         if (!protocol_->OpenAudioChannel()) {
-            audio_service_.EnableWakeWordDetection(true);
+            // Return to idle so the device is not stuck in the connecting
+            // state (not every failure path reports a network error), and
+            // wake word detection is re-enabled by the idle state handler.
+            SetDeviceState(kDeviceStateIdle);
             return;
         }
     }
@@ -865,6 +926,9 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
 void Application::HandleStateChangedEvent() {
     DeviceState new_state = state_machine_.GetState();
     clock_ticks_ = 0;
+    // Any state change invalidates a pending deferred listening start;
+    // the Listening case below re-arms it when needed.
+    pending_listening_start_ = false;
 
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
@@ -898,30 +962,17 @@ void Application::HandleStateChangedEvent() {
 
             // Make sure the audio processor is running
             if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {
-                // For auto mode, wait for playback queue to be empty before enabling voice
-                // processing This prevents audio truncation when STOP arrives late due to network
-                // jitter
-                if (listening_mode_ == kListeningModeAutoStop) {
-                    audio_service_.WaitForPlaybackQueueEmpty();
+                // For auto mode, wait for the playback queue to drain before enabling
+                // voice processing. This prevents audio truncation when STOP arrives
+                // late due to network jitter. Instead of blocking the main loop here,
+                // defer the start until MAIN_EVENT_PLAYBACK_DRAINED arrives.
+                if (listening_mode_ == kListeningModeAutoStop && !audio_service_.IsPlaybackIdle()) {
+                    pending_listening_start_ = true;
+                } else {
+                    StartListeningAudio();
                 }
-
-                // Send the start listening command
-                protocol_->SendStartListening(listening_mode_);
-                audio_service_.EnableVoiceProcessing(true);
-            }
-
-#ifdef CONFIG_WAKE_WORD_DETECTION_IN_LISTENING
-            // Enable wake word detection in listening mode (configured via Kconfig)
-            audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
-#else
-            // Disable wake word detection in listening mode
-            audio_service_.EnableWakeWordDetection(false);
-#endif
-
-            // Play popup sound after ResetDecoder (in EnableVoiceProcessing) has been called
-            if (play_popup_on_listening_) {
-                play_popup_on_listening_ = false;
-                audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
+            } else {
+                ConfigureWakeWordForListening();
             }
             break;
         case kDeviceStateSpeaking:
@@ -942,6 +993,36 @@ void Application::HandleStateChangedEvent() {
             // Do nothing
             break;
     }
+}
+
+void Application::StartListeningAudio() {
+    // Runs in the main loop, either directly from HandleStateChangedEvent or
+    // deferred via MAIN_EVENT_PLAYBACK_DRAINED once the playback queue drains.
+    if (GetDeviceState() != kDeviceStateListening) {
+        return;
+    }
+
+    // Send the start listening command
+    protocol_->SendStartListening(listening_mode_);
+    audio_service_.EnableVoiceProcessing(true);
+
+    ConfigureWakeWordForListening();
+
+    // Play popup sound after ResetDecoder (in EnableVoiceProcessing) has been called
+    if (play_popup_on_listening_) {
+        play_popup_on_listening_ = false;
+        audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
+    }
+}
+
+void Application::ConfigureWakeWordForListening() {
+#ifdef CONFIG_WAKE_WORD_DETECTION_IN_LISTENING
+    // Enable wake word detection in listening mode (configured via Kconfig)
+    audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+#else
+    // Disable wake word detection in listening mode
+    audio_service_.EnableWakeWordDetection(false);
+#endif
 }
 
 void Application::Schedule(std::function<void()>&& callback) {
@@ -1043,18 +1124,14 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
     }
 
     auto state = GetDeviceState();
-
     if (state == kDeviceStateIdle) {
-        audio_service_.EncodeWakeWord();
-
-        if (!protocol_->IsAudioChannelOpened()) {
-            SetDeviceState(kDeviceStateConnecting);
-            // Schedule to let the state change be processed first (UI update)
-            Schedule([this, wake_word]() { ContinueWakeWordInvoke(wake_word); });
-            return;
-        }
-        // Channel already opened, continue directly
-        ContinueWakeWordInvoke(wake_word);
+        // May be called from outside the main task (e.g. board button
+        // callbacks), so schedule the invocation instead of running it here
+        Schedule([this, wake_word]() {
+            if (GetDeviceState() == kDeviceStateIdle) {
+                BeginWakeWordInvoke(wake_word);
+            }
+        });
     } else if (state == kDeviceStateSpeaking) {
         Schedule([this]() { AbortSpeaking(kAbortReasonNone); });
     } else if (state == kDeviceStateListening) {
@@ -1089,7 +1166,7 @@ void Application::RegisterMcpBroadcastCallback(std::function<void(const std::str
 
 void Application::SendMcpMessage(const std::string& payload) {
     // Always schedule to run in main task for thread safety
-    Schedule([this, payload](){ 
+    Schedule([this, payload]() {
         if (protocol_) {
             protocol_->SendMcpMessage(payload);
         }
@@ -1127,7 +1204,6 @@ void Application::SetAecMode(AecMode mode) {
 }
 
 void Application::PlaySound(const std::string_view& sound) { audio_service_.PlaySound(sound); }
-
 void Application::HandleSpeakRequestInternal(const std::string& session_id,
                                              const std::string& text) {
     ESP_LOGI(TAG, "Received speak_request from server, session_id: %s", session_id.c_str());
