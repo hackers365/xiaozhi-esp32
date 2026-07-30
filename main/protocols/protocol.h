@@ -35,7 +35,7 @@ enum AbortReason { kAbortReasonNone, kAbortReasonWakeWordDetected };
 enum ListeningMode {
     kListeningModeAutoStop,
     kListeningModeManualStop,
-    kListeningModeRealtime  // Requires AEC support
+    kListeningModeRealtime  // Requires AEC support / 需要 AEC 支持
 };
 
 class Protocol {
@@ -85,6 +85,7 @@ protected:
     virtual bool SendText(const std::string& text) = 0;
     virtual void SetError(const std::string& message);
     virtual bool IsTimeout() const;
+    static void AddTextFontCapabilities(cJSON* root);
 };
 
 #endif  // PROTOCOL_H
